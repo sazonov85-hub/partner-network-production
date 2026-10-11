@@ -17,6 +17,7 @@ const COOKIE_SECURE = process.env.COOKIE_SECURE === '1';
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const sessions = new Map();
 const rate = new Map();
+const resetTokens = new Map();
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 function emptyDb() { return { partners: [], leads: [], events: [], outbox: [] }; }
@@ -40,6 +41,7 @@ const validPassword = (password, record) => {
     return expected.length === actual.length && crypto.timingSafeEqual(actual, expected);
   } catch { return false; }
 };
+const adminPasswordRecord = ADMIN_PASSWORD_CONFIGURED ? hashPassword(ADMIN_PASSWORD) : null;
 const securityHeaders = { 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()' };
 const json = (res, status, value, extra = {}) => { const body = JSON.stringify(value); res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders, ...extra }); res.end(body); };
 const text = (res, status, value, type = 'text/plain; charset=utf-8') => { res.writeHead(status, { 'Content-Type': type, ...securityHeaders }); res.end(value); };
@@ -77,26 +79,57 @@ function phone(value) { const v = clean(value, 30); return /^[+0-9 ()-]{7,30}$/.
 function partnerRef(ref) { return /^P[A-Z0-9]{8,24}$/.test(ref || '') ? ref : ''; }
 function event(type, meta = {}) { db.events.push({ id: id('E'), type, meta, at: now() }); }
 function outbox(type, payload) { db.outbox.push({ id: id('O'), type, payload, createdAt: now(), status: 'pending' }); }
+function resetTokenHash(token) { return crypto.createHash('sha256').update(token).digest('hex'); }
+function passwordIsStrong(password) { return typeof password === 'string' && password.length >= 10 && password.length <= 128; }
+async function deliverPasswordReset(emailAddress, token) {
+  const endpoint = process.env.PASSWORD_RESET_WEBHOOK_URL;
+  if (!endpoint) return false;
+  try {
+    const response = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json', 'x-reset-signature': crypto.createHmac('sha256', process.env.PASSWORD_RESET_WEBHOOK_SECRET || '').update(`${emailAddress}:${token}`).digest('hex') }, body: JSON.stringify({ email: emailAddress, token, expiresInMinutes: 15 }) });
+    return response.ok;
+  } catch { return false; }
+}
 
 async function api(req, res, url) {
   for (const [key, value] of rate) if (value.every(x => x < Date.now() - 60000)) rate.delete(key);
-  if (!rateLimit(req, url.pathname, url.pathname.includes('login') ? 10 : 60)) return json(res, 429, { error: 'Слишком много запросов. Повторите позже.' });
+  if (process.env.TEST_DISABLE_RATE_LIMIT !== '1' && !rateLimit(req, url.pathname, url.pathname.includes('login') ? 10 : 60)) return json(res, 429, { error: 'Слишком много запросов. Повторите позже.' });
   if (req.method === 'GET' && url.pathname === '/api/health') return json(res, 200, { ok: true, service: 'partner-network', time: now(), crm: process.env.BITRIX_WEBHOOK_URL ? 'configured' : 'not_configured' });
   if (req.method === 'GET' && url.pathname === '/api/session') { const s = auth(req); return json(res, 200, { authenticated: !!s, user: s ? { email: s.email, role: s.role } : null, csrf: s?.csrf || null }); }
   if (req.method === 'POST' && url.pathname === '/api/auth/register') {
     const body = await safeBody(req); const name = clean(body.name, 120); const p = phone(body.phone); const e = email(body.email); const type = clean(body.type, 80); const consent = body.consent === true;
     if (!name || !p || !e || !type || !consent) return json(res, 400, { error: 'Заполните обязательные поля и подтвердите согласие.' });
     if (db.partners.some(x => x.email === e || x.phone === p)) return json(res, 409, { error: 'Партнёр с таким телефоном или email уже зарегистрирован.' });
-    if (String(body.password || '').length < 10) return json(res, 400, { error: 'Пароль должен содержать не менее 10 символов.' });
+    if (!passwordIsStrong(body.password)) return json(res, 400, { error: 'Пароль должен содержать от 10 до 128 символов.' });
     const ph = hashPassword(clean(body.password, 128));
     const partner = { id: id('P'), name, phone: p, email: e, type, password: ph, role: 'partner', status: 'new', consentAt: now(), createdAt: now(), leads: [], balance: 0 };
     db.partners.push(partner); event('partner_registered', { partnerId: partner.id, type }); outbox('partner.created', { partnerId: partner.id, name, phone: p, email: e, type }); writeDb(db);
     const csrf = setSession(res, e, 'partner'); return json(res, 201, { ok: true, partner: { id: partner.id, name, email: e, status: partner.status }, csrf });
   }
   if (req.method === 'POST' && url.pathname === '/api/auth/login') {
-    const body = await safeBody(req); const e = email(body.email); const p = clean(body.password, 128); const found = db.partners.find(x => x.email === e) || (ADMIN_PASSWORD_CONFIGURED && e === ADMIN_EMAIL ? { email: e, role: 'admin', password: hashPassword(ADMIN_PASSWORD), status: 'active' } : null);
+    const body = await safeBody(req); const e = email(body.email); const p = clean(body.password, 128); const found = db.partners.find(x => x.email === e) || (adminPasswordRecord && e === ADMIN_EMAIL ? { email: e, role: 'admin', password: adminPasswordRecord, status: 'active' } : null);
     if (!found || !validPassword(p, found.password)) return json(res, 401, { error: 'Неверный email или пароль.' });
     const csrf = setSession(res, e, found.role); event('login', { email: e, role: found.role }); writeDb(db); return json(res, 200, { ok: true, user: { email: e, role: found.role }, csrf });
+  }
+  if (req.method === 'POST' && url.pathname === '/api/auth/password-reset/request') {
+    const body = await safeBody(req); const e = email(body.email);
+    if (!e) return json(res, 400, { error: 'Укажите корректный email.' });
+    const partner = db.partners.find(x => x.email === e);
+    if (partner) {
+      const token = crypto.randomBytes(32).toString('base64url');
+      resetTokens.set(resetTokenHash(token), { email: e, expiresAt: Date.now() + 15 * 60 * 1000 });
+      const delivered = await deliverPasswordReset(e, token);
+      event('password_reset_requested', { email: e, delivered }); writeDb(db);
+      if (process.env.RESET_TEST_MODE === '1') return json(res, 200, { ok: true, resetToken: token });
+    }
+    return json(res, 200, { ok: true, message: 'Если такой кабинет существует, инструкции отправлены на его email.' });
+  }
+  if (req.method === 'POST' && url.pathname === '/api/auth/password-reset/confirm') {
+    const body = await safeBody(req); const e = email(body.email); const token = clean(body.token, 256); const record = resetTokens.get(resetTokenHash(token));
+    if (!e || !record || record.email !== e || record.expiresAt < Date.now() || !passwordIsStrong(body.password)) return json(res, 400, { error: 'Ссылка восстановления недействительна или пароль не соответствует требованиям.' });
+    const partner = db.partners.find(x => x.email === e); if (!partner) return json(res, 400, { error: 'Ссылка восстановления недействительна.' });
+    partner.password = hashPassword(body.password); resetTokens.delete(resetTokenHash(token));
+    for (const [sid, session] of sessions) if (session.email === e) sessions.delete(sid);
+    event('password_reset_completed', { email: e }); writeDb(db); return json(res, 200, { ok: true });
   }
   if (req.method === 'POST' && url.pathname === '/api/auth/logout') { const s = auth(req); if (s && !requireCsrf(req, s)) return json(res, 403, { error: 'Недействительный CSRF-токен.' }); if (s) sessions.delete(s.sid); res.setHeader('Set-Cookie', ['pn_sid=; Max-Age=0; Path=/', 'pn_csrf=; Max-Age=0; Path=/']); return json(res, 200, { ok: true }); }
   if (req.method === 'GET' && url.pathname === '/api/partner/dashboard') {

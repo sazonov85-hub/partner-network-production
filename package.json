@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "private": true,
   "description": "Production-oriented partner network pilot without external runtime dependencies",
-  "scripts": {"start": "node server.js", "check": "node --check server.js"},
+  "scripts": {"start": "node server.js", "check": "node --check server.js", "test:security": "node tests/security-dashboard.cjs", "test:regression": "node tests/1000-regression.cjs", "test:scenarios": "node tests/10000-scenarios.cjs"},
   "engines": {"node": ">=18"}
 }
