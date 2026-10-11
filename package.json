@@ -1,0 +1,8 @@
+{
+  "name": "partner-network-production-pilot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-oriented partner network pilot without external runtime dependencies",
+  "scripts": {"start": "node server.js", "check": "node --check server.js"},
+  "engines": {"node": ">=18"}
+}

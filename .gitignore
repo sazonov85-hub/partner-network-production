@@ -1,0 +1,5 @@
+node_modules/
+*.log
+*.backup
+data/*.tmp
+data/*.backup
